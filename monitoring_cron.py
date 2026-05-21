@@ -28,6 +28,24 @@ COVAL_API_KEY = os.environ.get("COVAL_API_KEY", "")
 COVAL_AGENT_ID = os.environ.get("COVAL_AGENT_ID", "")
 POOL_PATH = os.environ.get("POOL_PATH", "/app/pool/transcripts.json")
 
+# Bronchase Bank monitoring metric panel — fires on every cron-submitted
+# conversation. Mirrors the "default_monitoring_metrics" pattern used by
+# orgs like Yelp/Upstart, applied per-submit because the org-level field
+# is admin-only.
+#
+#   mcQXZCsaqh2zBJPR7Thdvv  Conversation Success           (catch-all)
+#   kbrdk2BpHZqpfYU7nXxi7P  Account Read-Back Discipline   (catches STT mis-transcription)
+#   AC2rTByy8Hbn6MsaBZKHq5  Identity Verification Enforced (regulatory)
+#   C3Stso3JxATCxFHyzA3kxS  Scam Detection                 (adversarial)
+#   ntXD4Qp3ni4pJtMWFtRkbz  Workflow Completion Rate       (trace metric)
+DEFAULT_MONITORING_METRICS = [
+    "mcQXZCsaqh2zBJPR7Thdvv",
+    "kbrdk2BpHZqpfYU7nXxi7P",
+    "AC2rTByy8Hbn6MsaBZKHq5",
+    "C3Stso3JxATCxFHyzA3kxS",
+    "ntXD4Qp3ni4pJtMWFtRkbz",
+]
+
 
 def main() -> int:
     if not COVAL_API_KEY:
@@ -58,10 +76,12 @@ def main() -> int:
         "agent_id": COVAL_AGENT_ID,
         "transcript": transcript,
         "occurred_at": datetime.now(timezone.utc).isoformat(),
+        "metrics": DEFAULT_MONITORING_METRICS,
         "metadata": {
             "source": "fly_cron_monitoring",
             "vertical": "banking",
             "brand": "Bronchase Bank",
+            "environment": "production",
         },
     }
 
