@@ -20,9 +20,12 @@ import json
 import logging
 import os
 import random
+import time
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+import coval_tracing
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
@@ -45,6 +48,20 @@ VALID_ACCOUNT_NUMBERS = {
     "1008847",  # Alessandra Choi (business)
     "1007711",  # Marcus Tate (last 4 SSN 7711)
 }
+
+
+def _extract_call_id(body: dict, message: dict) -> str:
+    """Handle Vapi payload variants without coupling tracing to one shape."""
+    call = message.get("call") if isinstance(message.get("call"), dict) else {}
+    body_call = body.get("call") if isinstance(body.get("call"), dict) else {}
+    return (
+        call.get("id")
+        or message.get("callId")
+        or message.get("call_id")
+        or body_call.get("id")
+        or body.get("callId")
+        or ""
+    )
 
 
 def _one_digit_off(candidate: str, valid: str) -> bool:
@@ -294,15 +311,22 @@ def _report_fraud(args: dict) -> str:
 
 @app.post("/webhook")
 async def vapi_webhook(request: Request):
+    request_start = time.perf_counter()
     body = await request.json()
     message = body.get("message", {})
     msg_type = message.get("type", "")
     call = message.get("call", {})
-    call_id = call.get("id", "")
+    call_id = _extract_call_id(body, message)
 
     logger.info(f"Vapi webhook: type={msg_type} call={call_id}")
+    coval_tracing.record_vapi_event(call_id, msg_type)
 
     if msg_type == "assistant-request":
+        coval_tracing.record_assistant_request(
+            call_id,
+            message,
+            (time.perf_counter() - request_start) * 1000,
+        )
         return JSONResponse({"assistantId": CASSIDY_ASSISTANT_ID})
 
     if msg_type == "tool-calls":
@@ -319,23 +343,63 @@ async def vapi_webhook(request: Request):
                 args = {}
 
             handler = _MOCK_TOOLS.get(name)
+            start = time.perf_counter()
             if handler:
                 result = handler(args)
                 logger.info(f"  Tool call: {name} succeeded={_tool_succeeded(result)}")
             else:
                 result = json.dumps({"error": f"Unknown tool: {name}"})
                 logger.warning(f"  Unknown tool: {name}")
+            latency_ms = (time.perf_counter() - start) * 1000
+            coval_tracing.record_tool_call(
+                call_id=call_id,
+                tool_call_id=tc.get("id", ""),
+                name=name or "unknown",
+                args=args,
+                result=result,
+                latency_ms=latency_ms,
+            )
 
             results.append({"toolCallId": tc.get("id", ""), "result": result})
 
+        coval_tracing.record_webhook(
+            call_id=call_id,
+            msg_type="tool-calls",
+            message=message,
+            latency_ms=(time.perf_counter() - request_start) * 1000,
+            attributes={"tool.call.batch_size": len(tool_list)},
+        )
         return JSONResponse({"results": results})
 
     if msg_type == "end-of-call-report":
-        logger.info(f"  Call ended: call={call_id} reason={call.get('endedReason', '')}")
+        ended_reason = message.get("endedReason") or call.get("endedReason", "")
+        logger.info(f"  Call ended: call={call_id} reason={ended_reason}")
+        export_result = coval_tracing.finish_call(
+            call_id,
+            message,
+            (time.perf_counter() - request_start) * 1000,
+        )
+        logger.info(f"  Coval trace export result: {export_result}")
 
     return JSONResponse({})
 
 
+@app.post("/register-simulation")
+async def register_simulation(request: Request):
+    headers = {key.lower(): value for key, value in request.headers.items()}
+    if not coval_tracing.registration_authorized(headers):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    body = await request.json()
+    simulation_id = body.get("simulation_output_id") or body.get("simulation_id")
+    run_id = body.get("run_id")
+    try:
+        result = coval_tracing.register_simulation(simulation_id, run_id)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse(result)
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "tracing": coval_tracing.debug_status()}
